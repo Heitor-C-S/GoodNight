@@ -79,6 +79,7 @@ def cancelAction():
         if system == "Windows":
             CREATE_NO_WINDOW = 0x08000000
             subprocess.run(["shutdown", "/a"], capture_output=True, creationflags=CREATE_NO_WINDOW)
+            subprocess.run(["taskkill", "/F", "/IM", "timeout.exe"], capture_output=True, creationflags=CREATE_NO_WINDOW)
             
             if os.path.exists(STATUS_FILE):
                 try:
