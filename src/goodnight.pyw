@@ -14,6 +14,7 @@ class GoodNightApp:
         self.utils = Utils(self)
         self.scheduler = Scheduler(self)
         self.isAProcessRunning = False
+        self.hibernate_process = None
         self.create_widgets()
         self.scheduler.checkForExistingAction()
            

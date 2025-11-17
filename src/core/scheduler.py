@@ -1,10 +1,10 @@
-import customtkinter as ctk
+# ----- core/scheduler.py ----- #
+import json
 import os
 import platform
 import subprocess
-from plyer import notification
-import json
 import time
+from plyer import notification
 from appdirs import user_data_dir
 
 # ----- PERSISTENCY CONSTANTS ----- #
@@ -16,10 +16,6 @@ STATUS_FILE = os.path.join(STATUS_DIR, "status.json")
 
 class Scheduler:
     def __init__(self, controller):
-        """
-        Inicia o agendador.
-        'controller' é a instância da classe GoodNightApp.
-        """
         self.controller = controller
 
     def addXMinutes(self, time_to_add):
@@ -41,6 +37,19 @@ class Scheduler:
         self.controller.timeEntry.delete(0, "end")
         self.controller.timeEntry.insert(0, str(new_value))
 
+    def _checkHibernationEnabled(self):
+        """Check if hibernation is enabled on the system."""
+        try:
+            result = subprocess.run(
+                ["powercfg", "/a"],
+                capture_output=True,
+                text=True,
+                creationflags=0x08000000
+            )
+            return "hibernate" in result.stdout.lower() and "not supported" not in result.stdout.lower()
+        except:
+            return False
+
     def scheduleAction(self, action):
         if self.controller.isAProcessRunning:
             self.controller.statusLabel.configure(text="An action is already scheduled.\nCancel it before starting a new one.")
@@ -57,35 +66,62 @@ class Scheduler:
                 seconds = minutes * 60
 
             system = platform.system()
-            command = ""
-
-            if system == "Windows":
-                if action == 'shutdown':
-                    command = f"shutdown /s /t {seconds}"
-                elif action == 'sleep':
-                    command = f"timeout /t {seconds} /nobreak && shutdown /h"
-                    action = 'hibernate'
-
-            if command:
-                CREATE_NO_WINDOW = 0x08000000
-                subprocess.Popen(command, shell=True, creationflags=CREATE_NO_WINDOW)
-                
-                try:
-                    end_time = time.time() + seconds
-                    status_data = {"action": action, "end_time": end_time}
-                    os.makedirs(STATUS_DIR, exist_ok=True)
-                    with open(STATUS_FILE, "w") as f:
-                        json.dump(status_data, f)
-                except OSError as e:
-                    print(f"FAILED TO WRITE STATUS FILE: {e} ")
-
-                self.controller.isAProcessRunning = True 
-                self.controller.showCustomToast(action, minutes) 
-                self.controller.statusLabel.configure(text=f"PC will {action} in {minutes} minute(s).")
-            else:
+            if system != "Windows":
                 self.controller.statusLabel.configure(text=f"Action not supported on {system}.")
+                return
+
+            CREATE_NO_WINDOW = 0x08000000
+            
+            if action == 'shutdown':
+                command = ["shutdown", "/s", "/t", str(seconds)]
+                subprocess.Popen(command, creationflags=CREATE_NO_WINDOW)
+                
+                end_time = time.time() + seconds
+                self._saveStatus(action, end_time)
+                
+            elif action in ['sleep', 'hibernate']:
+                # Check if hibernation is enabled
+                if not self._checkHibernationEnabled():
+                    self.controller.statusLabel.configure(
+                        text="Hibernation is disabled on your system.\nRun 'powercfg /h on' in Admin CMD to enable."
+                    )
+                    return
+
+                # Use rundll32 for explicit hibernation (more reliable than shutdown /h)
+                ps_script = f'''
+$seconds = {seconds}
+$statusFile = "{STATUS_FILE}"
+Start-Sleep -Seconds $seconds
+if (Test-Path $statusFile) {{ Remove-Item $statusFile -Force }}
+# Hibernation command - only works if hibernation is enabled
+rundll32.exe powrprof.dll,SetSuspendState 1,1,0
+'''
+                command = [
+                    "powershell.exe",
+                    "-WindowStyle", "Hidden",
+                    "-NoLogo",
+                    "-NonInteractive",
+                    "-Command", ps_script
+                ]
+                self.controller.hibernate_process = subprocess.Popen(
+                    command, creationflags=CREATE_NO_WINDOW
+                )
+            
+            self.controller.isAProcessRunning = True 
+            self.controller.showCustomToast(action, minutes) 
+            self.controller.statusLabel.configure(text=f"PC will {action} in {minutes} minute(s).")
+            
         except ValueError:
             self.controller.statusLabel.configure(text="Invalid input. Please enter 0 or more minutes.")
+
+    def _saveStatus(self, action, end_time):
+        """Helper to save status file for shutdown actions."""
+        try:
+            os.makedirs(STATUS_DIR, exist_ok=True)
+            with open(STATUS_FILE, "w") as f:
+                json.dump({"action": action, "end_time": end_time}, f)
+        except OSError as e:
+            print(f"FAILED TO WRITE STATUS FILE: {e}")
 
     def cancelAction(self):
         if not self.controller.isAProcessRunning:
@@ -95,9 +131,19 @@ class Scheduler:
         system = platform.system()
         if system == "Windows":
             CREATE_NO_WINDOW = 0x08000000
-            subprocess.run(["shutdown", "/a"], capture_output=True, creationflags=CREATE_NO_WINDOW)
-            subprocess.run(["taskkill", "/F", "/IM", "timeout.exe"], capture_output=True, creationflags=CREATE_NO_WINDOW)
             
+            # Kill PowerShell hibernation process if it exists
+            if self.controller.hibernate_process:
+                try:
+                    self.controller.hibernate_process.kill()
+                except ProcessLookupError:
+                    pass
+                self.controller.hibernate_process = None
+
+            # Cancel native Windows shutdown
+            subprocess.run(["shutdown", "/a"], capture_output=True, creationflags=CREATE_NO_WINDOW)
+            
+            # Clean up status file
             if os.path.exists(STATUS_FILE):
                 try:
                     os.remove(STATUS_FILE)
@@ -108,11 +154,11 @@ class Scheduler:
             self.controller.statusLabel.configure(text="Scheduled action canceled.")
             notification.notify(
                 title="Goodnight: Canceled!", message="The scheduled action was successfully canceled.",
-                app_name='GoodNight', app_icon=None, timeout=5
+                app_name='GoodNight', timeout=5
             )
 
     def checkForExistingAction(self):
-        """Esta função roda na inicialização para checar o arquivo de flag."""
+        """Checks for existing shutdown action on app start."""
         if os.path.exists(STATUS_FILE):
             try:
                 with open(STATUS_FILE, "r") as f:
@@ -123,11 +169,12 @@ class Scheduler:
                     action = status_data.get("action", "unknown action")
                     self.controller.statusLabel.configure(text=f"An active '{action}' is already scheduled.")
                 else:
-                    if os.path.exists(STATUS_FILE):
-                        os.remove(STATUS_FILE)
+                    os.remove(STATUS_FILE)
                     self.controller.isAProcessRunning = False
             except (json.JSONDecodeError, FileNotFoundError, OSError):
                 if os.path.exists(STATUS_FILE):
                     try: os.remove(STATUS_FILE)
                     except OSError: pass
                 self.controller.isAProcessRunning = False
+        else:
+            self.controller.isAProcessRunning = False
